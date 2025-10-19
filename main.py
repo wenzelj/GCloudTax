@@ -1,57 +1,24 @@
-# main.py (Updated Python code for the Summarization/Extraction Service)
+# main.py (Updated Python code for the Summarization/Extraction Service - Logging only)
 
 import os
 import json
-import base64 # Still needed if you decide to use Pub/Sub later
+import base64
 from flask import Flask, request
 from google.cloud import storage
 from google.cloud import documentai_v1beta3 as documentai
-from google.cloud import secretmanager
-import psycopg2 # For PostgreSQL interaction
+# Removed: from google.cloud import secretmanager
+# Removed: import psycopg2
 
 app = Flask(__name__)
 
 # --- Configuration ---
 PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "valid-expanse-470905-f1")
 LOCATION = os.environ.get("LOCATION", "us-central1") # Region where your Cloud Run and Document AI processor are
-DOCUMENT_AI_PROCESSOR_ID = os.environ.get("DOCUMENT_AI_PROCESSOR_ID", "YOUR_DOCUMENT_AI_PROCESSOR_ID") # Replace with your actual processor ID
-DB_SECRET_NAME = os.environ.get("DB_SECRET_NAME", "tax-data-extractor-db-credentials") # Name of your Secret Manager secret
+DOCUMENT_AI_PROCESSOR_ID = os.environ.get("DOCUMENT_AI_PROCESSOR_ID", "4fc47710a3a194c8") # Replace with your actual processor ID
 
 # Initialize Google Cloud clients
 storage_client = storage.Client(project=PROJECT_ID)
-documentai_client = documentai.DocumentProcessorServiceClient(client_options={"api_endpoint": f"{LOCATION}-documentai.googleapis.com"}) # Specify endpoint for regional processor
-secret_client = secretmanager.SecretManagerServiceClient()
-
-# --- Database Connection (will be established on first request or at startup) ---
-db_connection = None
-
-def get_db_connection():
-    global db_connection
-    if db_connection is None:
-        try:
-            # Fetch database credentials from Secret Manager
-            secret_response = secret_client.access_secret_version(
-                request={"name": f"projects/{PROJECT_ID}/secrets/{DB_SECRET_NAME}/versions/latest"}
-            )
-            db_credentials_json = secret_response.payload.data.decode("UTF-8")
-            db_credentials = json.loads(db_credentials_json)
-
-            # Cloud SQL Proxy or Private IP connection details
-            # For Cloud Run, typically you'd use a VPC Access Connector
-            # and connect via the private IP of your Cloud SQL instance.
-            # For simplicity, this example assumes direct connection (e.g., if public IP is enabled on Cloud SQL for testing)
-            # In production, strongly recommend Private IP + VPC Access Connector.
-            db_connection = psycopg2.connect(
-                host=db_credentials["host"],
-                database=db_credentials["database"],
-                user=db_credentials["user"],
-                password=db_credentials["password"]
-            )
-            print("Successfully connected to PostgreSQL database.")
-        except Exception as e:
-            print(f"Error connecting to database: {e}")
-            raise
-    return db_connection
+documentai_client = documentai.DocumentProcessorServiceClient(client_options={"api_endpoint": f"{LOCATION}-documentai.googleapis.com"})
 
 @app.route("/", methods=["POST"])
 def process_document():
@@ -88,58 +55,36 @@ def process_document():
         response_doc_ai = documentai_client.process_document(request=request_doc_ai)
         document = response_doc_ai.document
 
-        # 3. Extract relevant data from Document AI response
-        # This part is highly dependent on your document structure and processor output
-        extracted_data = {"document_path": f"gs://{bucket_name}/{file_name}"}
-        tax_id_found = False
-        tax_amount_found = False
+        # --- IMPORTANT CHANGE: Log the full Document AI output ---
+        # Convert the Document object to a JSON string for easy viewing in logs
+        document_json = json.dumps(document.to_json(), indent=2)
+        print(f"--- Full Document AI Output for {file_name} ---")
+        print(document_json)
+        print(f"--- End Document AI Output for {file_name} ---")
 
+        # 3. (Optional) Basic extraction for quick overview
+        extracted_summary = {}
         for entity in document.entities:
-            # Example: Extracting fields from a Form Parser output
-            # You'll need to inspect the Document AI output for your specific document type
-            # and adjust these entity.type_ values accordingly.
-            if entity.type_ == "tax_id" and not tax_id_found: # Assuming 'tax_id' is a field
-                extracted_data["tax_id"] = entity.mention_text
-                tax_id_found = True
-            elif entity.type_ == "total_tax_amount" and not tax_amount_found: # Assuming 'total_tax_amount' is a field
-                extracted_data["tax_amount"] = entity.mention_text
-                tax_amount_found = True
-            # Add more fields as needed based on your Document AI processor's output
+            # You can still do some basic parsing here to get a quick summary
+            # but the full JSON is what we want to inspect.
+            if entity.type_ == "tax_id":
+                extracted_summary["tax_id"] = entity.mention_text
+            elif entity.type_ == "total_tax_amount":
+                extracted_summary["total_tax_amount"] = entity.mention_text
+            # Add other key fields you expect
 
-        # If specific fields aren't found, you might want to log it or set to None
-        if not tax_id_found:
-            extracted_data["tax_id"] = None
-        if not tax_amount_found:
-            extracted_data["tax_amount"] = None
+        print(f"Quick extracted summary: {extracted_summary}")
 
-        print(f"Extracted data: {extracted_data}")
+        # Removed: Database interaction
 
-        # 4. Store extracted data in PostgreSQL
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        # Ensure your table 'extracted_tax_data' exists with appropriate columns
-        insert_query = """
-        INSERT INTO extracted_tax_data (document_path, tax_id, tax_amount, raw_doc_ai_response)
-        VALUES (%s, %s, %s, %s::jsonb);
-        """
-        cursor.execute(insert_query, (
-            extracted_data["document_path"],
-            extracted_data["tax_id"],
-            extracted_data["tax_amount"],
-            document.to_json() # Store full Document AI response as JSONB
-        ))
-        conn.commit()
-        cursor.close()
-
-        # 5. Archive processed document (optional, but good practice)
+        # 4. Archive processed document (optional, but good practice)
         # For now, let's just print a message. You can implement moving/copying here.
-        print(f"Document gs://{bucket_name}/{file_name} processed and archived (conceptually).")
+        print(f"Document gs://{bucket_name}/{file_name} processed (Document AI output logged).")
 
-        return "Document processed successfully", 200
+        return "Document processed and output logged successfully", 200
 
     except Exception as e:
         print(f"Error processing document: {e}")
-        # In a real application, you'd want more sophisticated error handling and logging
         return f"Internal Server Error: {e}", 500
 
 if __name__ == "__main__":
