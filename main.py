@@ -12,8 +12,8 @@ from google.cloud import documentai_v1beta3 as documentai
 app = Flask(__name__)
 
 # --- Configuration ---
-PROJECT_ID = os.environ.get("GCP_PROJECT_ID") # Get directly from env var
-LOCATION = os.environ.get("LOCATION")       # Get directly from env var
+PROJECT_ID = "valid-expanse-470905-f1" # Get directly from env var
+LOCATION = "us-central1"      # Get directly from env var
 DOCUMENT_AI_PROCESSOR_ID = "4fc47710a3a194c8"
 
 # Add more print statements for debugging environment variables
