@@ -13,7 +13,7 @@ app = Flask(__name__)
 
 # --- Configuration ---
 PROJECT_ID = "valid-expanse-470905-f1" # Get directly from env var
-LOCATION = "us-central1"      # Get directly from env var
+LOCATION = "us"      # Get directly from env var
 DOCUMENT_AI_PROCESSOR_ID = "4fc47710a3a194c8"
 
 # Add more print statements for debugging environment variables
