@@ -1,94 +1,104 @@
-# main.py (Updated Python code for the Summarization/Extraction Service - with more debugging)
-
 import os
 import json
-import base64
+import logging
 from flask import Flask, request
 from google.cloud import storage
-from google.cloud import documentai_v1beta3 as documentai
-# Removed: from google.cloud import secretmanager
-# Removed: import psycopg2
+from google.cloud import documentai_v1 as documentai # Recommended V1 API
+from google.cloud.exceptions import NotFound, BadRequest
+
+# --- Configuration & Logging ---
+# Configure standard logging for Cloud Run/Cloud Functions integration
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Use os.getenv for safer access with no default values (fail fast if not set)
+PROJECT_ID = os.getenv("GCP_PROJECT_ID", "valid-expanse-470905-f1") 
+LOCATION = os.getenv("LOCATION", "us")
+DOCUMENT_AI_PROCESSOR_ID = os.getenv("DOCUMENT_AI_PROCESSOR_ID", "4fc47710a3a194c8")
 
 app = Flask(__name__)
 
-# --- Configuration ---
-PROJECT_ID = "valid-expanse-470905-f1" # Get directly from env var
-LOCATION = "us"      # Get directly from env var
-DOCUMENT_AI_PROCESSOR_ID = "4fc47710a3a194c8"
-
-# Add more print statements for debugging environment variables
-print(f"DEBUG: PROJECT_ID from env: {PROJECT_ID}")
-print(f"DEBUG: LOCATION from env: {LOCATION}")
-print(f"DEBUG: DOCUMENT_AI_PROCESSOR_ID from env: {DOCUMENT_AI_PROCESSOR_ID}")
-
-# Validate essential environment variables early
-if not PROJECT_ID:
-    print("ERROR: GCP_PROJECT_ID environment variable is not set!")
-    exit(1) # Exit early if critical config is missing
-if not LOCATION:
-    print("ERROR: LOCATION environment variable is not set!")
-    exit(1)
-if not DOCUMENT_AI_PROCESSOR_ID:
-    print("ERROR: DOCUMENT_AI_PROCESSOR_ID environment variable is not set!")
-    exit(1)
-
-
-# Initialize Google Cloud clients with explicit error handling
+# --- Initialization & Client Setup ---
+# Initialize Google Cloud clients once globally
 storage_client = None
 documentai_client = None
 
-try:
-    print("DEBUG: Initializing storage_client...")
-    storage_client = storage.Client(project=PROJECT_ID)
-    print("DEBUG: storage_client initialized.")
-except Exception as e:
-    print(f"ERROR: Failed to initialize storage_client: {e}")
-    exit(1) # Exit if client fails to initialize
+def initialize_clients():
+    """Initializes Google Cloud clients and validates configuration."""
+    global storage_client, documentai_client
+    
+    if not all([PROJECT_ID, LOCATION, DOCUMENT_AI_PROCESSOR_ID]):
+        logger.error("Critical configuration missing. Check PROJECT_ID, LOCATION, or PROCESSOR_ID environment variables.")
+        raise EnvironmentError("Critical GCP configuration is missing.")
 
+    try:
+        logger.info(f"Initializing storage_client for project: {PROJECT_ID}")
+        storage_client = storage.Client(project=PROJECT_ID)
+        
+        logger.info(f"Initializing documentai_client for location: {LOCATION}")
+        # Construct the API endpoint for the client based on the location
+        endpoint = f"{LOCATION}-documentai.googleapis.com"
+        documentai_client = documentai.DocumentProcessorServiceClient(
+            client_options={"api_endpoint": endpoint}
+        )
+        logger.info("All clients initialized successfully.")
+    except Exception as e:
+        logger.critical(f"Failed to initialize one or more GCP clients: {e}")
+        # Re-raise to prevent the application from starting without essential services
+        raise
+
+# Initialize clients on startup
 try:
-    print("DEBUG: Initializing documentai_client...")
-    # Ensure the API endpoint is correctly formed and used
-    documentai_client = documentai.DocumentProcessorServiceClient(client_options={"api_endpoint": f"{LOCATION}-documentai.googleapis.com"})
-    print("DEBUG: documentai_client initialized.")
-except Exception as e:
-    print(f"ERROR: Failed to initialize documentai_client: {e}")
-    exit(1) # Exit if client fails to initialize
+    initialize_clients()
+except EnvironmentError:
+    # Exit if configuration is bad
+    exit(1)
+except Exception:
+    # Exit if client initialization fails
+    exit(1)
 
 
 @app.route("/", methods=["POST"])
 def process_document():
+    # Ensure clients are ready before processing the request (safe guard)
+    if storage_client is None or documentai_client is None:
+        logger.error("GCP clients were not initialized properly.")
+        return "Internal Server Error: Service not ready.", 503 # Service Unavailable
+        
     try:
         request_json = request.get_json(silent=True)
         if not request_json:
-            print("ERROR: Invalid JSON payload received.")
-            return "Invalid JSON payload. Expected {'bucket_name': 'your-bucket', 'file_name': 'your-file.pdf'}", 400
+            logger.warning("Invalid JSON payload received.")
+            return "Invalid JSON payload. Expected {'bucket_name': '...', 'file_name': '...'}", 400
 
         bucket_name = request_json.get("bucket_name")
         file_name = request_json.get("file_name")
-        generation = request_json.get("generation") # Optional, for specific file versions
+        # generation is now handled implicitly by blob access for simplicity
 
         if not bucket_name or not file_name:
-            print("ERROR: Missing 'bucket_name' or 'file_name' in payload.")
+            logger.warning("Missing 'bucket_name' or 'file_name' in payload.")
             return "Missing 'bucket_name' or 'file_name' in payload", 400
 
-        print(f"Processing document: gs://{bucket_name}/{file_name}")
+        logger.info(f"Processing document: gs://{bucket_name}/{file_name}")
 
         # 1. Read PDF from Cloud Storage
         try:
-            print(f"DEBUG: Attempting to get blob for gs://{bucket_name}/{file_name}")
             bucket = storage_client.bucket(bucket_name)
-            blob = bucket.blob(file_name, generation=generation)
+            blob = bucket.blob(file_name)
             pdf_content = blob.download_as_bytes()
-            print(f"DEBUG: Successfully downloaded {file_name} from GCS.")
+            logger.info(f"Successfully downloaded {file_name} ({len(pdf_content)} bytes) from GCS.")
+        except NotFound:
+            logger.error(f"File not found: gs://{bucket_name}/{file_name}")
+            return "File not found in Google Cloud Storage.", 404
         except Exception as e:
-            print(f"ERROR: Failed to download PDF from GCS: {e}")
-            return f"Internal Server Error: Failed to download PDF: {e}", 500
+            logger.error(f"Failed to download PDF from GCS: {e}")
+            return "Internal Server Error: Failed to download PDF.", 500
 
 
         # 2. Process PDF with Document AI
         try:
             processor_path = documentai_client.processor_path(PROJECT_ID, LOCATION, DOCUMENT_AI_PROCESSOR_ID)
-            print(f"DEBUG: Document AI Processor Path: {processor_path}")
+            
             raw_document = documentai.RawDocument(
                 content=pdf_content,
                 mime_type="application/pdf"
@@ -97,39 +107,53 @@ def process_document():
                 name=processor_path,
                 raw_document=raw_document
             )
-            print("DEBUG: Sending request to Document AI...")
+            
             response_doc_ai = documentai_client.process_document(request=request_doc_ai)
             document = response_doc_ai.document
-            print("DEBUG: Received response from Document AI.")
+            logger.info("Received successful response from Document AI.")
+        except BadRequest as e:
+            # Handle API-specific client errors (e.g., bad format, wrong processor)
+            logger.error(f"Document AI API Error (400 Bad Request): {e}")
+            return f"Document AI processing failed (Bad Request): {e}", 400
         except Exception as e:
-            print(f"ERROR: Failed to process document with Document AI: {e}")
-            return f"Internal Server Error: Document AI processing failed: {e}", 500
+            logger.error(f"Failed to process document with Document AI: {e}")
+            return "Internal Server Error: Document AI processing failed.", 500
 
 
-        # --- IMPORTANT CHANGE: Log the full Document AI output ---
-        # Convert the Document object to a JSON string for easy viewing in logs
-        document_json = json.dumps(document.to_json(), indent=2)
-        print(f"--- Full Document AI Output for {file_name} ---")
-        print(document_json)
-        print(f"--- End Document AI Output for {file_name} ---")
-
-        # 3. (Optional) Basic extraction for quick overview
-        extracted_summary = {}
+        # 3. Comprehensive Entity Extraction
+        extracted_entities = {}
         for entity in document.entities:
-            if entity.type_ == "tax_id":
-                extracted_summary["tax_id"] = entity.mention_text
-            elif entity.type_ == "total_tax_amount":
-                extracted_summary["total_tax_amount"] = entity.mention_text
+            # Extract all entities detected by the Document AI processor
+            entity_type = entity.type_
+            # Use confidence score for better data quality assessment (optional but good practice)
+            entity_text = entity.mention_text
+            
+            # Group multiple entities of the same type into a list
+            if entity_type not in extracted_entities:
+                extracted_entities[entity_type] = []
+            
+            extracted_entities[entity_type].append(entity_text)
+            
+        logger.info(f"Extracted {len(document.entities)} entities from document.")
+        
+        # Log the extracted entities as structured JSON for easy filtering in Cloud Logging
+        logger.info(json.dumps({"extracted_entities": extracted_entities}, indent=2))
+        
+        # (Optional) Log the full Document AI output only if debugging is necessary, as it can be very large.
+        # document_json = json.dumps(document.to_json(), indent=2)
+        # logger.debug(f"Full Document AI Output: {document_json}") 
 
-        print(f"Quick extracted summary: {extracted_summary}")
+        logger.info(f"Document gs://{bucket_name}/{file_name} processed successfully.")
 
-        print(f"Document gs://{bucket_name}/{file_name} processed (Document AI output logged).")
-
-        return "Document processed and output logged successfully", 200
+        # Return the extracted entities as a successful response payload
+        return json.dumps(extracted_entities), 200
 
     except Exception as e:
-        print(f"ERROR: Unhandled exception in process_document: {e}")
-        return f"Internal Server Error: {e}", 500
+        logger.exception(f"Unhandled exception in process_document: {e}")
+        return "Internal Server Error: An unexpected error occurred.", 500
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    # Note: Cloud Run/Cloud Functions set the PORT env var automatically.
+    port = int(os.environ.get("PORT", 8080))
+    # It's better to run the app directly and let the execution environment handle the port
+    app.run(host="0.0.0.0", port=port)
