@@ -7,11 +7,10 @@ from google.cloud import documentai_v1 as documentai # Recommended V1 API
 from google.cloud.exceptions import NotFound, BadRequest
 
 # --- Configuration & Logging ---
-# Configure standard logging for Cloud Run/Cloud Functions integration
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Use os.getenv for safer access with no default values (fail fast if not set)
+# NOTE: Keeping the original default values for consistency
 PROJECT_ID = os.getenv("GCP_PROJECT_ID", "valid-expanse-470905-f1") 
 LOCATION = os.getenv("LOCATION", "us")
 DOCUMENT_AI_PROCESSOR_ID = os.getenv("DOCUMENT_AI_PROCESSOR_ID", "4fc47710a3a194c8")
@@ -19,7 +18,6 @@ DOCUMENT_AI_PROCESSOR_ID = os.getenv("DOCUMENT_AI_PROCESSOR_ID", "4fc47710a3a194
 app = Flask(__name__)
 
 # --- Initialization & Client Setup ---
-# Initialize Google Cloud clients once globally
 storage_client = None
 documentai_client = None
 
@@ -36,7 +34,6 @@ def initialize_clients():
         storage_client = storage.Client(project=PROJECT_ID)
         
         logger.info(f"Initializing documentai_client for location: {LOCATION}")
-        # Construct the API endpoint for the client based on the location
         endpoint = f"{LOCATION}-documentai.googleapis.com"
         documentai_client = documentai.DocumentProcessorServiceClient(
             client_options={"api_endpoint": endpoint}
@@ -44,26 +41,21 @@ def initialize_clients():
         logger.info("All clients initialized successfully.")
     except Exception as e:
         logger.critical(f"Failed to initialize one or more GCP clients: {e}")
-        # Re-raise to prevent the application from starting without essential services
         raise
 
-# Initialize clients on startup
 try:
     initialize_clients()
 except EnvironmentError:
-    # Exit if configuration is bad
     exit(1)
 except Exception:
-    # Exit if client initialization fails
     exit(1)
 
 
 @app.route("/", methods=["POST"])
 def process_document():
-    # Ensure clients are ready before processing the request (safe guard)
     if storage_client is None or documentai_client is None:
         logger.error("GCP clients were not initialized properly.")
-        return "Internal Server Error: Service not ready.", 503 # Service Unavailable
+        return "Internal Server Error: Service not ready.", 503
         
     try:
         request_json = request.get_json(silent=True)
@@ -73,7 +65,6 @@ def process_document():
 
         bucket_name = request_json.get("bucket_name")
         file_name = request_json.get("file_name")
-        # generation is now handled implicitly by blob access for simplicity
 
         if not bucket_name or not file_name:
             logger.warning("Missing 'bucket_name' or 'file_name' in payload.")
@@ -112,7 +103,6 @@ def process_document():
             document = response_doc_ai.document
             logger.info("Received successful response from Document AI.")
         except BadRequest as e:
-            # Handle API-specific client errors (e.g., bad format, wrong processor)
             logger.error(f"Document AI API Error (400 Bad Request): {e}")
             return f"Document AI processing failed (Bad Request): {e}", 400
         except Exception as e:
@@ -120,15 +110,14 @@ def process_document():
             return "Internal Server Error: Document AI processing failed.", 500
 
 
-        # 3. Comprehensive Entity Extraction
+        # --- IMPROVED EXTRACTION LOGIC ---
+        # 3. Comprehensive Entity Extraction for all detected fields
         extracted_entities = {}
         for entity in document.entities:
-            # Extract all entities detected by the Document AI processor
             entity_type = entity.type_
-            # Use confidence score for better data quality assessment (optional but good practice)
             entity_text = entity.mention_text
             
-            # Group multiple entities of the same type into a list
+            # Group multiple entities of the same type (like multiple 'marginal_rate' fields)
             if entity_type not in extracted_entities:
                 extracted_entities[entity_type] = []
             
@@ -136,12 +125,9 @@ def process_document():
             
         logger.info(f"Extracted {len(document.entities)} entities from document.")
         
-        # Log the extracted entities as structured JSON for easy filtering in Cloud Logging
+        # Log the extracted entities as structured JSON
         logger.info(json.dumps({"extracted_entities": extracted_entities}, indent=2))
-        
-        # (Optional) Log the full Document AI output only if debugging is necessary, as it can be very large.
-        # document_json = json.dumps(document.to_json(), indent=2)
-        # logger.debug(f"Full Document AI Output: {document_json}") 
+        # --- END IMPROVED LOGIC ---
 
         logger.info(f"Document gs://{bucket_name}/{file_name} processed successfully.")
 
@@ -153,7 +139,5 @@ def process_document():
         return "Internal Server Error: An unexpected error occurred.", 500
 
 if __name__ == "__main__":
-    # Note: Cloud Run/Cloud Functions set the PORT env var automatically.
     port = int(os.environ.get("PORT", 8080))
-    # It's better to run the app directly and let the execution environment handle the port
     app.run(host="0.0.0.0", port=port)
